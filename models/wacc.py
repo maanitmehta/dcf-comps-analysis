@@ -6,7 +6,12 @@ from config import EQUITY_RISK_PREMIUM, TAX_RATE_DEFAULT
 from data.fetcher import get_company_profile, get_balance_sheet, get_income_statement, get_risk_free_rate
 
 
-def compute_wacc(ticker: str, risk_free_rate: float = None) -> dict:
+def compute_wacc(
+    ticker: str,
+    risk_free_rate: float = None,
+    erp_override: float = None,
+    beta_override: float = None,
+) -> dict:
     """
     Returns WACC components and final WACC as a dict.
 
@@ -15,9 +20,10 @@ def compute_wacc(ticker: str, risk_free_rate: float = None) -> dict:
     WACC            = (E/V) × Ke + (D/V) × Kd × (1 − t)
     """
     rfr = risk_free_rate if risk_free_rate is not None else get_risk_free_rate()
+    erp = erp_override if erp_override is not None else EQUITY_RISK_PREMIUM
 
     profile = get_company_profile(ticker)
-    beta = profile.get("beta") or 1.0
+    beta = beta_override if beta_override is not None else (profile.get("beta") or 1.0)
 
     bs = get_balance_sheet(ticker, 1)[0]
     inc = get_income_statement(ticker, 1)[0]
@@ -34,7 +40,7 @@ def compute_wacc(ticker: str, risk_free_rate: float = None) -> dict:
     tax_rate = income_tax / pretax_income if pretax_income > 0 else TAX_RATE_DEFAULT
     tax_rate = min(max(tax_rate, 0.05), 0.40)
 
-    cost_of_equity = rfr + beta * EQUITY_RISK_PREMIUM
+    cost_of_equity = rfr + beta * erp
 
     cost_of_debt = (interest_expense / total_debt) if total_debt > 0 else rfr
     cost_of_debt = min(cost_of_debt, 0.20)

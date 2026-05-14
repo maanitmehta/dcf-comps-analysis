@@ -45,13 +45,14 @@ def _get_multiples(ticker: str) -> dict:
         return None
 
 
-def build_comps_table(ticker: str, max_peers: int = 6) -> dict:
+def build_comps_table(ticker: str, max_peers: int = 6, custom_peers: list = None) -> dict:
     """
     Returns comps table for target + peers, plus median multiples
     and implied valuation range from those medians.
+    custom_peers overrides the API-sourced peer list when provided.
     """
-    peers = get_peers(ticker)[:max_peers]
-    all_tickers = [ticker] + peers
+    peers = custom_peers if custom_peers is not None else get_peers(ticker)[:max_peers]
+    all_tickers = [ticker] + [p for p in peers if p != ticker]
 
     rows = []
     for t in all_tickers:

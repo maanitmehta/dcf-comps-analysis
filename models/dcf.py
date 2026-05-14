@@ -12,6 +12,9 @@ def run_dcf(
     revenue_growth_rates: list = None,
     terminal_growth_rate: float = 0.025,
     wacc_override: float = None,
+    rfr_override: float = None,
+    erp_override: float = None,
+    beta_override: float = None,
 ) -> dict:
     """
     Full DCF model. Returns intrinsic value per share and all intermediate steps.
@@ -29,7 +32,8 @@ def run_dcf(
     if revenue_growth_rates is None:
         revenue_growth_rates = _estimate_growth(historical)
 
-    wacc_data = compute_wacc(ticker)
+    wacc_data = compute_wacc(ticker, risk_free_rate=rfr_override,
+                              erp_override=erp_override, beta_override=beta_override)
     wacc = wacc_override if wacc_override is not None else wacc_data["wacc"]
 
     projected_fcfs = project_fcf(base_fcf, revenue_growth_rates)
