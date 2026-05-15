@@ -47,6 +47,20 @@ app = dash.Dash(
 )
 server = app.server
 
+def _warm_cache(ticker: str) -> None:
+    try:
+        get_income_statement(ticker, 5)
+        get_balance_sheet(ticker, 5)
+        get_cash_flow(ticker, 5)
+        get_company_profile(ticker)
+        get_peers(ticker)
+    except Exception:
+        pass
+
+# Pre-fetch the 3 most common tickers in background on server startup
+for _t in ["AAPL", "MSFT", "TSLA"]:
+    threading.Thread(target=_warm_cache, args=(_t,), daemon=True).start()
+
 # ── Loading overlay CSS ────────────────────────────────────────────────────────
 
 app.index_string = """<!DOCTYPE html>

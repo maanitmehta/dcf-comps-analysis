@@ -14,7 +14,7 @@ _mem_cache: dict = {}
 _mem_lock = threading.Lock()
 
 # ── Semaphore: cap concurrent FMP API calls to avoid free-tier throttling ─────
-_api_sem = threading.Semaphore(3)
+_api_sem = threading.Semaphore(5)
 
 
 def _load_cache(key: str):
