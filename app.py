@@ -10,6 +10,7 @@ import dash_bootstrap_components as dbc
 import pandas as pd
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from data.fetcher import (validate_ticker, get_company_profile, get_risk_free_rate,
                            get_live_price, is_market_open, get_historical_prices,
                            get_income_statement, get_balance_sheet, get_cash_flow, get_peers)
@@ -488,14 +489,26 @@ def run_analysis(_, _apply, ticker, growth_pct, tgr_pct, sidebar, custom_peers):
     beta = sb.get("beta")
 
     growth_rates = [growth, growth, growth * 0.85, growth * 0.85, growth * 0.70]
-
-    dcf = run_dcf(ticker, revenue_growth_rates=growth_rates, terminal_growth_rate=tgr,
-                  rfr_override=rfr, erp_override=erp, beta_override=beta)
-    scenarios = scenario_analysis(ticker, dcf)
-    sens = wacc_growth_sensitivity(ticker, dcf["wacc"], tgr, steps=5, growth_rates=growth_rates)
     peers_arg = custom_peers if custom_peers else None
-    comps = build_comps_table(ticker, max_peers=6, custom_peers=peers_arg)
-    profile = get_company_profile(ticker)
+
+    # Phase 1 — run_dcf, comps, and profile are independent: fire all three at once
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_dcf     = ex.submit(run_dcf, ticker, growth_rates, tgr, None, rfr, erp, beta)
+        f_comps   = ex.submit(build_comps_table, ticker, 6, peers_arg)
+        f_profile = ex.submit(get_company_profile, ticker)
+
+    dcf     = f_dcf.result()
+    comps   = f_comps.result()
+    profile = f_profile.result()
+
+    # Phase 2 — scenarios and sensitivity both depend on dcf: run them in parallel
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_scen = ex.submit(scenario_analysis, ticker, dcf)
+        f_sens = ex.submit(wacc_growth_sensitivity, ticker, dcf["wacc"], tgr,
+                           steps=5, growth_rates=growth_rates)
+
+    scenarios = f_scen.result()
+    sens      = f_sens.result()
 
     return json.dumps({
         "ticker": ticker,
