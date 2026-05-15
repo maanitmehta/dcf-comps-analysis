@@ -2,47 +2,71 @@ import json
 import os
 import sys
 import time
+import threading
 import requests
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import FMP_API_KEY, FMP_BASE_URL, CACHE_DIR, CACHE_TTL_HOURS
 
+# ── In-memory cache (process-level, survives across requests in same worker) ──
+_mem_cache: dict = {}
+_mem_lock = threading.Lock()
 
-def _cache_path(key: str) -> str:
-    return os.path.join(CACHE_DIR, f"{key}.json")
+# ── Semaphore: cap concurrent FMP API calls to avoid free-tier throttling ─────
+_api_sem = threading.Semaphore(3)
 
 
 def _load_cache(key: str):
-    path = _cache_path(key)
+    # 1. Memory cache — instant
+    with _mem_lock:
+        if key in _mem_cache:
+            ts, data = _mem_cache[key]
+            if time.time() - ts < CACHE_TTL_HOURS * 3600:
+                return data
+            del _mem_cache[key]
+
+    # 2. File cache — persists across cold starts on same instance
+    path = os.path.join(CACHE_DIR, f"{key}.json")
     if not os.path.exists(path):
         return None
-    age_hours = (time.time() - os.path.getmtime(path)) / 3600
-    if age_hours > CACHE_TTL_HOURS:
+    if (time.time() - os.path.getmtime(path)) / 3600 > CACHE_TTL_HOURS:
         return None
-    with open(path) as f:
-        return json.load(f)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        with _mem_lock:
+            _mem_cache[key] = (time.time(), data)
+        return data
+    except Exception:
+        return None
 
 
 def _save_cache(key: str, data) -> None:
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    with open(_cache_path(key), "w") as f:
-        json.dump(data, f)
+    with _mem_lock:
+        _mem_cache[key] = (time.time(), data)
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(os.path.join(CACHE_DIR, f"{key}.json"), "w") as f:
+            json.dump(data, f)
+    except Exception:
+        pass
 
 
 def _get(endpoint: str, params: dict = None):
     params = params or {}
     params["apikey"] = FMP_API_KEY
     url = f"{FMP_BASE_URL}/{endpoint}"
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    with _api_sem:          # max 3 concurrent calls — prevents FMP throttling
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        return r.json()
 
 
 def get_income_statement(ticker: str, limit: int = 5) -> list:
     key = f"income_{ticker}_{limit}"
     cached = _load_cache(key)
-    if cached:
+    if cached is not None:
         return cached
     data = _get("income-statement", {"symbol": ticker, "limit": limit, "period": "annual"})
     _save_cache(key, data)
@@ -52,7 +76,7 @@ def get_income_statement(ticker: str, limit: int = 5) -> list:
 def get_balance_sheet(ticker: str, limit: int = 5) -> list:
     key = f"balance_{ticker}_{limit}"
     cached = _load_cache(key)
-    if cached:
+    if cached is not None:
         return cached
     data = _get("balance-sheet-statement", {"symbol": ticker, "limit": limit, "period": "annual"})
     _save_cache(key, data)
@@ -62,7 +86,7 @@ def get_balance_sheet(ticker: str, limit: int = 5) -> list:
 def get_cash_flow(ticker: str, limit: int = 5) -> list:
     key = f"cashflow_{ticker}_{limit}"
     cached = _load_cache(key)
-    if cached:
+    if cached is not None:
         return cached
     data = _get("cash-flow-statement", {"symbol": ticker, "limit": limit, "period": "annual"})
     _save_cache(key, data)
@@ -72,7 +96,7 @@ def get_cash_flow(ticker: str, limit: int = 5) -> list:
 def get_company_profile(ticker: str) -> dict:
     key = f"profile_{ticker}"
     cached = _load_cache(key)
-    if cached:
+    if cached is not None:
         return cached[0] if isinstance(cached, list) else cached
     data = _get("profile", {"symbol": ticker})
     _save_cache(key, data)
@@ -82,7 +106,7 @@ def get_company_profile(ticker: str) -> dict:
 def get_peers(ticker: str) -> list:
     key = f"peers_{ticker}"
     cached = _load_cache(key)
-    if cached:
+    if cached is not None:
         return cached
     data = _get("stock-peers", {"symbol": ticker})
     peers = [p["symbol"] for p in data] if data else []
@@ -90,54 +114,53 @@ def get_peers(ticker: str) -> list:
     return peers
 
 
-def get_risk_free_rate() -> float:
-    """Pull 10Y US Treasury yield from FRED (no API key needed)."""
-    try:
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
-        r = requests.get(url, timeout=10)
-        lines = r.text.strip().split("\n")
-        for line in reversed(lines):
-            parts = line.split(",")
-            if len(parts) == 2 and parts[1].strip() != ".":
-                return float(parts[1].strip()) / 100
-    except Exception:
-        pass
-    from config import RISK_FREE_RATE_DEFAULT
-    return RISK_FREE_RATE_DEFAULT
-
-
 def get_historical_prices(ticker: str, limit: int = 252) -> list:
-    """Fetch up to `limit` trading days of EOD price data, newest first."""
     key = f"hist_{ticker}_{limit}"
     cached = _load_cache(key)
-    if cached:
+    if cached is not None:
         return cached
     data = _get("historical-price-eod/full", {"symbol": ticker, "limit": limit})
     _save_cache(key, data)
     return data
 
 
+def get_risk_free_rate() -> float:
+    key = "rfr_fred"
+    cached = _load_cache(key)
+    if cached is not None:
+        return cached
+    try:
+        r = requests.get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10",
+                         timeout=10)
+        for line in reversed(r.text.strip().split("\n")):
+            parts = line.split(",")
+            if len(parts) == 2 and parts[1].strip() != ".":
+                rfr = float(parts[1].strip()) / 100
+                _save_cache(key, rfr)
+                return rfr
+    except Exception:
+        pass
+    from config import RISK_FREE_RATE_DEFAULT
+    return RISK_FREE_RATE_DEFAULT
+
+
 def get_live_price(ticker: str) -> dict:
-    """Fetch current price + change without using the cache."""
     try:
         data = _get("quote-short", {"symbol": ticker})
         if data:
-            price = data[0].get("price", 0) or 0
+            price  = data[0].get("price",  0) or 0
             change = data[0].get("change", 0) or 0
-            prev_close = price - change
-            change_pct = (change / prev_close * 100) if prev_close else 0
-            return {"price": price, "change": change, "change_pct": round(change_pct, 2)}
+            prev   = price - change
+            return {"price": price, "change": change,
+                    "change_pct": round(change / prev * 100, 2) if prev else 0}
     except Exception:
         pass
     return {"price": 0, "change": 0, "change_pct": 0}
 
 
 def is_market_open() -> bool:
-    """Check if NYSE is currently open (Mon–Fri 09:30–16:00 ET, approximate)."""
-    # EDT = UTC-4 (Mar–Nov), EST = UTC-5 (Nov–Mar)
     utc_now = datetime.now(timezone.utc)
-    month = utc_now.month
-    et_offset = timedelta(hours=-4 if 3 <= month <= 11 else -5)
+    et_offset = timedelta(hours=-4 if 3 <= utc_now.month <= 11 else -5)
     et_now = (utc_now + et_offset).replace(tzinfo=None)
     if et_now.weekday() >= 5:
         return False
@@ -148,7 +171,6 @@ def is_market_open() -> bool:
 
 def validate_ticker(ticker: str) -> bool:
     try:
-        profile = get_company_profile(ticker.upper())
-        return bool(profile.get("symbol"))
+        return bool(get_company_profile(ticker.upper()).get("symbol"))
     except Exception:
         return False
