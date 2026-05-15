@@ -9,7 +9,10 @@ from dash import dcc, html, Input, Output, State, callback_context, no_update
 import dash_bootstrap_components as dbc
 import pandas as pd
 
-from data.fetcher import validate_ticker, get_company_profile, get_risk_free_rate, get_live_price, is_market_open
+import threading
+from data.fetcher import (validate_ticker, get_company_profile, get_risk_free_rate,
+                           get_live_price, is_market_open,
+                           get_income_statement, get_balance_sheet, get_cash_flow, get_peers)
 from models.dcf import run_dcf
 from models.sensitivity import wacc_growth_sensitivity, scenario_analysis
 from models.comps import build_comps_table
@@ -382,7 +385,19 @@ def save_sidebar(_, rfr, erp, beta_manual, beta_val, growth, tgr):
     }
 
 
-# Ticker validation
+def _prefetch(ticker: str) -> None:
+    """Warm the cache for a ticker in a background thread."""
+    try:
+        get_income_statement(ticker, 5)
+        get_balance_sheet(ticker, 5)
+        get_cash_flow(ticker, 5)
+        get_company_profile(ticker)
+        get_peers(ticker)
+    except Exception:
+        pass
+
+
+# Ticker validation + background cache warm-up
 @app.callback(
     Output("ticker-status", "children"),
     Output("ticker-status", "style"),
@@ -395,6 +410,8 @@ def validate(ticker, theme):
         return "", {}
     t = ticker.strip().upper()
     if validate_ticker(t):
+        # Pre-fetch financials in background so Analyse click hits cache
+        threading.Thread(target=_prefetch, args=(t,), daemon=True).start()
         return f"✓ {t} recognised", {"color": c["green"], "fontSize": "12px"}
     return f"✗ {t} not found", {"color": c["red"], "fontSize": "12px"}
 

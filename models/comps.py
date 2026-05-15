@@ -3,6 +3,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from data.fetcher import get_peers, get_company_profile, get_income_statement, get_balance_sheet
 
 
@@ -23,7 +24,6 @@ def _get_multiples(ticker: str) -> dict:
         revenue = inc0.get("revenue") or 0
         ebitda = inc0.get("ebitda") or 0
         net_income = inc0.get("netIncome") or 0
-        shares = profile.get("sharesOutstanding") or 1
         price = profile.get("price") or 0
         fcf_proxy = inc0.get("operatingCashFlow") or 0
 
@@ -38,7 +38,7 @@ def _get_multiples(ticker: str) -> dict:
             "price": price,
             "ev_revenue": round(ev / revenue, 2) if revenue > 0 else None,
             "ev_ebitda": round(ev / ebitda, 2) if ebitda > 0 else None,
-            "pe": round(price * shares / net_income, 2) if net_income > 0 else None,
+            "pe": round(market_cap / net_income, 2) if net_income > 0 else None,
             "p_fcf": round(market_cap / fcf_proxy, 2) if fcf_proxy > 0 else None,
         }
     except Exception:
@@ -49,20 +49,26 @@ def build_comps_table(ticker: str, max_peers: int = 6, custom_peers: list = None
     """
     Returns comps table for target + peers, plus median multiples
     and implied valuation range from those medians.
-    custom_peers overrides the API-sourced peer list when provided.
+    Fetches all peers in parallel for speed.
     """
     peers = custom_peers if custom_peers is not None else get_peers(ticker)[:max_peers]
     all_tickers = [ticker] + [p for p in peers if p != ticker]
 
+    # Fetch all tickers in parallel
     rows = []
-    for t in all_tickers:
-        m = _get_multiples(t)
-        if m:
-            m["is_target"] = (t == ticker)
-            rows.append(m)
+    with ThreadPoolExecutor(max_workers=min(len(all_tickers), 8)) as ex:
+        future_to_ticker = {ex.submit(_get_multiples, t): t for t in all_tickers}
+        for future in as_completed(future_to_ticker):
+            m = future.result()
+            if m:
+                m["is_target"] = (future_to_ticker[future] == ticker)
+                rows.append(m)
 
     if not rows:
         return {"rows": [], "medians": {}, "implied_prices": {}}
+
+    # Keep target first, then peers alphabetically
+    rows.sort(key=lambda r: (not r["is_target"], r["ticker"]))
 
     target = next((r for r in rows if r["is_target"]), None)
     peers_rows = [r for r in rows if not r["is_target"]]
@@ -81,16 +87,13 @@ def build_comps_table(ticker: str, max_peers: int = 6, custom_peers: list = None
     implied = {}
     if target:
         shares = target["market_cap"] / target["price"] if target["price"] > 0 else 1
-        net_debt = sum(
-            (r.get("ev", 0) - r.get("market_cap", 0))
-            for r in rows if r["is_target"]
-        )
+        net_debt = target["ev"] - target["market_cap"]
         if medians["ev_revenue"] and target["revenue"]:
-            eq = medians["ev_revenue"] * target["revenue"] - net_debt
-            implied["ev_revenue"] = round(eq / shares, 2)
+            implied["ev_revenue"] = round(
+                (medians["ev_revenue"] * target["revenue"] - net_debt) / shares, 2)
         if medians["ev_ebitda"] and target["ebitda"]:
-            eq = medians["ev_ebitda"] * target["ebitda"] - net_debt
-            implied["ev_ebitda"] = round(eq / shares, 2)
+            implied["ev_ebitda"] = round(
+                (medians["ev_ebitda"] * target["ebitda"] - net_debt) / shares, 2)
         if medians["pe"] and target["net_income"]:
             implied["pe"] = round(medians["pe"] * target["net_income"] / shares, 2)
 
