@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import requests
+from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import FMP_API_KEY, FMP_BASE_URL, CACHE_DIR, CACHE_TTL_HOURS
@@ -103,6 +104,35 @@ def get_risk_free_rate() -> float:
         pass
     from config import RISK_FREE_RATE_DEFAULT
     return RISK_FREE_RATE_DEFAULT
+
+
+def get_live_price(ticker: str) -> dict:
+    """Fetch current price + change without using the cache."""
+    try:
+        data = _get("quote-short", {"symbol": ticker})
+        if data:
+            price = data[0].get("price", 0) or 0
+            change = data[0].get("change", 0) or 0
+            prev_close = price - change
+            change_pct = (change / prev_close * 100) if prev_close else 0
+            return {"price": price, "change": change, "change_pct": round(change_pct, 2)}
+    except Exception:
+        pass
+    return {"price": 0, "change": 0, "change_pct": 0}
+
+
+def is_market_open() -> bool:
+    """Check if NYSE is currently open (Mon–Fri 09:30–16:00 ET, approximate)."""
+    # EDT = UTC-4 (Mar–Nov), EST = UTC-5 (Nov–Mar)
+    utc_now = datetime.now(timezone.utc)
+    month = utc_now.month
+    et_offset = timedelta(hours=-4 if 3 <= month <= 11 else -5)
+    et_now = (utc_now + et_offset).replace(tzinfo=None)
+    if et_now.weekday() >= 5:
+        return False
+    open_t  = et_now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_t = et_now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_t <= et_now <= close_t
 
 
 def validate_ticker(ticker: str) -> bool:

@@ -9,7 +9,7 @@ from dash import dcc, html, Input, Output, State, callback_context, no_update
 import dash_bootstrap_components as dbc
 import pandas as pd
 
-from data.fetcher import validate_ticker, get_company_profile, get_risk_free_rate
+from data.fetcher import validate_ticker, get_company_profile, get_risk_free_rate, get_live_price, is_market_open
 from models.dcf import run_dcf
 from models.sensitivity import wacc_growth_sensitivity, scenario_analysis
 from models.comps import build_comps_table
@@ -72,6 +72,34 @@ app.index_string = """<!DOCTYPE html>
 }
 @keyframes step-cycle {
     0%,20%  { --s:0; } 21%,40% { --s:1; } 41%,60% { --s:2; } 61%,80% { --s:3; } 81%,100% { --s:4; }
+}
+@keyframes pulse {
+    0%, 100% { opacity: 1; } 50% { opacity: 0.3; }
+}
+.live-badge {
+    display: inline-block;
+    background: #e94560;
+    color: #fff;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 10px;
+    letter-spacing: 1px;
+    animation: pulse 1.4s ease-in-out infinite;
+    vertical-align: middle;
+    margin-left: 8px;
+}
+.closed-badge {
+    display: inline-block;
+    background: #555;
+    color: #ccc;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 10px;
+    letter-spacing: 0.5px;
+    vertical-align: middle;
+    margin-left: 8px;
 }
 </style>
 </head>
@@ -264,6 +292,10 @@ app.layout = html.Div([
     dcc.Store(id="store-theme", data="dark"),
     dcc.Store(id="store-custom-peers", data=[]),
     dcc.Store(id="store-sidebar-vals", data={}),
+    dcc.Store(id="store-live-price", data={}),
+
+    # Price streaming — fires every 60s, enabled only when a ticker is loaded
+    dcc.Interval(id="price-interval", interval=60_000, disabled=True),
 
 ], id="page-wrapper", style={"backgroundColor": "#1a1a2e", "minHeight": "100vh"})
 
@@ -367,6 +399,32 @@ def validate(ticker, theme):
     return f"✗ {t} not found", {"color": c["red"], "fontSize": "12px"}
 
 
+# Enable price interval when analysis completes
+@app.callback(
+    Output("price-interval", "disabled"),
+    Input("store-results", "data"),
+)
+def enable_price_stream(data):
+    return data is None
+
+
+# Fetch live price every 60s
+@app.callback(
+    Output("store-live-price", "data"),
+    Input("price-interval", "n_intervals"),
+    State("store-results", "data"),
+    prevent_initial_call=True,
+)
+def stream_price(_, data):
+    if not data:
+        return {}
+    ticker = json.loads(data)["ticker"]
+    live = get_live_price(ticker)
+    live["market_open"] = is_market_open()
+    live["ticker"] = ticker
+    return live
+
+
 # Loading overlay — show on run, hide on results
 @app.callback(
     Output("loading-overlay", "style"),
@@ -440,19 +498,39 @@ def run_analysis(_, _apply, ticker, growth_pct, tgr_pct, sidebar, custom_peers):
     })
 
 
-# KPI strip
+# KPI strip — updates on both initial results and live price ticks
 @app.callback(
     Output("kpi-strip", "children"),
     Input("store-results", "data"),
+    Input("store-live-price", "data"),
     State("store-theme", "data"),
 )
-def update_kpis(data, theme):
+def update_kpis(data, live, theme):
     if not data:
         return ""
     c = THEMES[theme or "dark"]
     d = json.loads(data)
     dcf = d["dcf"]
-    price = d["current_price"]
+
+    # Use live price if available and for the same ticker, else fall back to snapshot
+    live = live or {}
+    if live.get("ticker") == d["ticker"] and live.get("price"):
+        price = live["price"]
+        change = live.get("change", 0)
+        change_pct = live.get("change_pct", 0)
+        market_open = live.get("market_open", False)
+        price_label = [
+            f"${price:.2f} ",
+            html.Span(f"{change:+.2f} ({change_pct:+.2f}%)",
+                      style={"fontSize": "12px",
+                             "color": c["green"] if change >= 0 else c["red"]}),
+            html.Span("LIVE" if market_open else "CLOSED",
+                      className="live-badge" if market_open else "closed-badge"),
+        ]
+    else:
+        price = d["current_price"]
+        price_label = f"${price:.2f}"
+
     intrinsic = dcf["intrinsic_price"]
     updown = ((intrinsic - price) / price * 100) if price else 0
     ud_color = c["green"] if updown >= 0 else c["red"]
@@ -466,7 +544,7 @@ def update_kpis(data, theme):
 
     return dbc.Row([
         kpi("Company",         d["company_name"][:18]),
-        kpi("Market Price",    f"${price:.2f}"),
+        kpi("Market Price",    price_label),
         kpi("Intrinsic (DCF)", f"${intrinsic:.2f}", ud_color),
         kpi("Upside/Downside", f"{updown:+.1f}%",  ud_color),
         kpi("WACC",            f"{dcf['wacc']:.2%}"),
