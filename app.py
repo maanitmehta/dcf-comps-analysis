@@ -11,7 +11,7 @@ import pandas as pd
 
 import threading
 from data.fetcher import (validate_ticker, get_company_profile, get_risk_free_rate,
-                           get_live_price, is_market_open,
+                           get_live_price, is_market_open, get_historical_prices,
                            get_income_statement, get_balance_sheet, get_cash_flow, get_peers)
 from models.dcf import run_dcf
 from models.sensitivity import wacc_growth_sensitivity, scenario_analysis
@@ -19,6 +19,7 @@ from models.comps import build_comps_table
 from dashboard.charts import (
     make_fcf_waterfall, make_sensitivity_heatmap, make_football_field,
     make_comps_table, make_wacc_decomp,
+    make_historical_valuation_chart, make_comparison_chart, make_comparison_table,
 )
 
 # ── Theme palettes ─────────────────────────────────────────────────────────────
@@ -280,10 +281,12 @@ app.layout = html.Div([
 
         # Tabs
         dbc.Tabs([
-            dbc.Tab(label="DCF Model",    tab_id="tab-dcf"),
-            dbc.Tab(label="Sensitivity",  tab_id="tab-sens"),
-            dbc.Tab(label="Comps",        tab_id="tab-comps"),
+            dbc.Tab(label="DCF Model",      tab_id="tab-dcf"),
+            dbc.Tab(label="Sensitivity",    tab_id="tab-sens"),
+            dbc.Tab(label="Comps",          tab_id="tab-comps"),
             dbc.Tab(label="Football Field", tab_id="tab-ff"),
+            dbc.Tab(label="Historical",     tab_id="tab-hist"),
+            dbc.Tab(label="Compare",        tab_id="tab-compare"),
         ], id="tabs", active_tab="tab-dcf", className="mb-3"),
 
         html.Div(id="tab-content"),
@@ -296,6 +299,7 @@ app.layout = html.Div([
     dcc.Store(id="store-custom-peers", data=[]),
     dcc.Store(id="store-sidebar-vals", data={}),
     dcc.Store(id="store-live-price", data={}),
+    dcc.Store(id="store-comparison", data=[]),
 
     # Price streaming — fires every 60s, enabled only when a ticker is loaded
     dcc.Interval(id="price-interval", interval=60_000, disabled=True),
@@ -649,6 +653,36 @@ def render_tab(active_tab, data, theme, custom_peers):
                               config={"displayModeBar": False}),
                     theme="dark" if dark else "light")
 
+    elif active_tab == "tab-hist":
+        hist = get_historical_prices(ticker, limit=252)
+        if not hist:
+            return html.P("No historical price data available.",
+                          style={"color": c["text"], "opacity": "0.5"})
+        fig = make_historical_valuation_chart(hist, d["scenarios"], ticker, dark=dark)
+        latest = hist[0]
+        pct_vs_base = ((latest["close"] - d["scenarios"]["base"]["price"])
+                       / d["scenarios"]["base"]["price"] * 100)
+        badge_color = c["red"] if pct_vs_base > 0 else c["green"]
+        badge_text  = f"{'Premium' if pct_vs_base > 0 else 'Discount'} to DCF: {pct_vs_base:+.1f}%"
+        return [
+            dbc.Row([
+                dbc.Col(dbc.Alert(badge_text, color="danger" if pct_vs_base > 0 else "success",
+                                  className="py-2 mb-3"), md=4),
+                dbc.Col(html.Small(
+                    "Green = trading below DCF intrinsic (undervalued)  ·  "
+                    "Red = trading above DCF intrinsic (overvalued)",
+                    style={"color": c["text"], "opacity": "0.5", "fontSize": "12px"}
+                ), md=8, className="d-flex align-items-center"),
+            ]),
+            card(f"{ticker} — 1-Year Price vs DCF Intrinsic",
+                 dcc.Graph(figure=fig, style={"height": "420px"},
+                           config={"displayModeBar": False}),
+                 theme="dark" if dark else "light"),
+        ]
+
+    elif active_tab == "tab-compare":
+        return _compare_ui(c)
+
     return ""
 
 
@@ -995,6 +1029,90 @@ def _implied_table(implied, market_price, c):
             html.Td(f"{updown:+.1f}%", style={"color": color, "fontWeight": "600"}),
         ]))
     return html.Table(html.Tbody(rows), style={"width": "100%"})
+
+
+# ── Compare UI & callback ──────────────────────────────────────────────────────
+
+def _compare_ui(c):
+    return html.Div([
+        dbc.Card(dbc.CardBody([
+            html.Label("Enter up to 3 tickers to compare", className="fw-semibold mb-2",
+                       style={"color": c["text"]}),
+            dbc.Row([
+                dbc.Col(dbc.Input(id="cmp-t1", placeholder="Ticker 1", value="AAPL",
+                                  type="text"), md=3),
+                dbc.Col(dbc.Input(id="cmp-t2", placeholder="Ticker 2", value="MSFT",
+                                  type="text"), md=3),
+                dbc.Col(dbc.Input(id="cmp-t3", placeholder="Ticker 3 (optional)",
+                                  type="text"), md=3),
+                dbc.Col(dbc.Button("Run Comparison", id="btn-compare",
+                                   color="success", className="w-100"), md=3),
+            ], className="g-2"),
+        ]), style={"backgroundColor": c["card"], "border": f"1px solid {c['border']}"},
+           className="mb-3"),
+        html.Div(id="compare-output"),
+    ])
+
+
+@app.callback(
+    Output("compare-output", "children"),
+    Input("btn-compare", "n_clicks"),
+    State("cmp-t1", "value"),
+    State("cmp-t2", "value"),
+    State("cmp-t3", "value"),
+    State("store-theme", "data"),
+    State("growth-slider", "value"),
+    State("tgr-slider", "value"),
+    prevent_initial_call=True,
+)
+def run_comparison(_, t1, t2, t3, theme, growth_pct, tgr_pct):
+    dark = (theme or "dark") == "dark"
+    c = THEMES["dark" if dark else "light"]
+    tickers = [t.strip().upper() for t in [t1, t2, t3] if t and t.strip()]
+    if not tickers:
+        return html.P("Enter at least one ticker.", style={"color": c["text"]})
+
+    growth = growth_pct / 100
+    tgr    = tgr_pct   / 100
+    growth_rates = [growth, growth, growth * 0.85, growth * 0.85, growth * 0.70]
+
+    def _run_one(ticker):
+        try:
+            dcf      = run_dcf(ticker, revenue_growth_rates=growth_rates,
+                                terminal_growth_rate=tgr)
+            scen     = scenario_analysis(ticker, dcf)
+            profile  = get_company_profile(ticker)
+            return {
+                "ticker":           ticker,
+                "current_price":    profile.get("price", 0),
+                "intrinsic_price":  dcf["intrinsic_price"],
+                "enterprise_value": dcf["enterprise_value"],
+                "wacc":             dcf["wacc"],
+                "bear":             scen["bear"]["price"],
+                "bull":             scen["bull"]["price"],
+            }
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        results = [r for r in ex.map(_run_one, tickers) if r]
+
+    if not results:
+        return html.P("Could not fetch data for any of those tickers.",
+                      style={"color": c["text"]})
+
+    fig_bars  = make_comparison_chart(results, dark=dark)
+    fig_table = make_comparison_table(results, dark=dark)
+
+    return [
+        card("DCF Comparison",
+             dcc.Graph(figure=fig_bars, style={"height": "380px"},
+                       config={"displayModeBar": False}),
+             theme="dark" if dark else "light"),
+        card("Metrics Summary",
+             dcc.Graph(figure=fig_table, config={"displayModeBar": False}),
+             theme="dark" if dark else "light"),
+    ]
 
 
 if __name__ == "__main__":

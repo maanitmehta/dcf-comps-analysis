@@ -1,4 +1,5 @@
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 THEMES = {
     "dark": {
@@ -281,6 +282,194 @@ def make_comps_table(rows: list, medians: dict, dark: bool = True) -> go.Figure:
             font=dict(color=c["text"], size=11),
             align="center",
             height=28,
+        ),
+    ))
+    fig.update_layout(paper_bgcolor=c["card"], margin=dict(l=0, r=0, t=10, b=0))
+    return fig
+
+
+def make_historical_valuation_chart(
+    prices: list, scenarios: dict, ticker: str, dark: bool = True
+) -> go.Figure:
+    """
+    1-year price history vs Bear/Base/Bull DCF intrinsic bands.
+    Price line turns green when below Base, red when above.
+    """
+    c = _t(dark)
+
+    # Sort oldest → newest
+    prices = sorted(prices, key=lambda r: r["date"])
+    dates = [r["date"] for r in prices]
+    closes = [r["close"] for r in prices]
+
+    bear = scenarios["bear"]["price"]
+    base = scenarios["base"]["price"]
+    bull = scenarios["bull"]["price"]
+
+    fig = go.Figure()
+
+    # Bull–Bear shaded band
+    fig.add_trace(go.Scatter(
+        x=dates + dates[::-1],
+        y=[bull] * len(dates) + [bear] * len(dates),
+        fill="toself",
+        fillcolor="rgba(0,212,170,0.08)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="DCF Range (Bear–Bull)",
+        hoverinfo="skip",
+    ))
+
+    # Base DCF line
+    fig.add_trace(go.Scatter(
+        x=dates, y=[base] * len(dates),
+        mode="lines",
+        line=dict(color=c["green"], dash="dash", width=1.5),
+        name=f"DCF Base  ${base:.2f}",
+    ))
+
+    # Bear / Bull reference lines
+    for label, val, dash in [("Bear", bear, "dot"), ("Bull", bull, "dot")]:
+        fig.add_trace(go.Scatter(
+            x=dates, y=[val] * len(dates),
+            mode="lines",
+            line=dict(color=c["grid"], dash=dash, width=1),
+            name=f"{label}  ${val:.2f}",
+        ))
+
+    # Price line — split into green (undervalued) and red (overvalued) segments
+    for i in range(len(closes)):
+        color = c["green"] if closes[i] <= base else c["red"]
+        if i == 0:
+            continue
+        fig.add_trace(go.Scatter(
+            x=dates[i-1:i+1],
+            y=closes[i-1:i+1],
+            mode="lines",
+            line=dict(color=color, width=2),
+            showlegend=(i == 1),
+            name="Market Price",
+            hovertemplate=f"%{{x}}<br>Price: $%{{y:.2f}}<extra></extra>",
+        ))
+
+    # Latest price annotation
+    fig.add_annotation(
+        x=dates[-1], y=closes[-1],
+        text=f" ${closes[-1]:.2f}",
+        showarrow=False, xanchor="left",
+        font=dict(color=c["text"], size=11),
+    )
+
+    layout = _base_layout(
+        f"{ticker} — 1-Year Price vs DCF Intrinsic Value", dark)
+    layout.update(
+        yaxis=dict(title="Price ($)", gridcolor=c["grid"], zerolinecolor=c["grid"]),
+        xaxis=dict(title="", gridcolor=c["grid"], zerolinecolor=c["grid"]),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="right", x=1, font=dict(color=c["text"])),
+    )
+    fig.update_layout(**layout)
+    return fig
+
+
+def make_comparison_chart(results: list, dark: bool = True) -> go.Figure:
+    """
+    Side-by-side comparison of DCF metrics across 2-3 tickers.
+    Top: Market Price vs DCF Intrinsic bar chart.
+    Bottom: WACC, EV/share, upside % table.
+    """
+    c = _t(dark)
+    tickers = [r["ticker"] for r in results]
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=["Market Price vs DCF Intrinsic ($)", "Upside / Downside (%)"],
+        horizontal_spacing=0.12,
+    )
+
+    # Left: grouped bar — market vs intrinsic
+    fig.add_trace(go.Bar(
+        name="Market Price",
+        x=tickers,
+        y=[r["current_price"] for r in results],
+        marker_color=c["accent"],
+        text=[f"${r['current_price']:.2f}" for r in results],
+        textposition="outside",
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        name="DCF Intrinsic",
+        x=tickers,
+        y=[r["intrinsic_price"] for r in results],
+        marker_color=c["green"],
+        text=[f"${r['intrinsic_price']:.2f}" for r in results],
+        textposition="outside",
+    ), row=1, col=1)
+
+    # Right: upside/downside bar
+    upsides = [
+        (r["intrinsic_price"] - r["current_price"]) / r["current_price"] * 100
+        if r["current_price"] else 0
+        for r in results
+    ]
+    fig.add_trace(go.Bar(
+        name="Upside / Downside",
+        x=tickers,
+        y=upsides,
+        marker_color=[c["green"] if u >= 0 else c["red"] for u in upsides],
+        text=[f"{u:+.1f}%" for u in upsides],
+        textposition="outside",
+        showlegend=False,
+    ), row=1, col=2)
+
+    fig.add_hline(y=0, line_color=c["text"], line_dash="dot",
+                  line_width=1, row=1, col=2)
+
+    layout = _base_layout("", dark)
+    layout.update(
+        barmode="group",
+        legend=dict(orientation="h", yanchor="bottom", y=1.05,
+                    xanchor="right", x=1, font=dict(color=c["text"])),
+        yaxis2=dict(title="%", gridcolor=c["grid"], zerolinecolor=c["grid"]),
+    )
+    for ann in fig.layout.annotations:
+        ann.font.color = c["text"]
+    fig.update_layout(**layout)
+    return fig
+
+
+def make_comparison_table(results: list, dark: bool = True) -> go.Figure:
+    c = _t(dark)
+    cols = ["Ticker", "Market Price", "DCF Intrinsic", "Upside", "WACC",
+            "EV ($B)", "Bear", "Bull"]
+    rows = {col: [] for col in cols}
+
+    for r in results:
+        price = r["current_price"]
+        intrinsic = r["intrinsic_price"]
+        updown = (intrinsic - price) / price * 100 if price else 0
+        rows["Ticker"].append(r["ticker"])
+        rows["Market Price"].append(f"${price:.2f}")
+        rows["DCF Intrinsic"].append(f"${intrinsic:.2f}")
+        rows["Upside"].append(f"{updown:+.1f}%")
+        rows["WACC"].append(f"{r['wacc']:.2%}")
+        rows["EV ($B)"].append(f"${r['enterprise_value']/1e9:.1f}B")
+        rows["Bear"].append(f"${r['bear']:.2f}")
+        rows["Bull"].append(f"${r['bull']:.2f}")
+
+    n = len(results)
+    cell_colors = [c["accent"], c["card"], c["card"],
+                   [c["green"] if "+" in rows["Upside"][i] else c["red"] for i in range(n)],
+                   c["card"], c["card"], c["card"], c["card"]]
+
+    fig = go.Figure(go.Table(
+        header=dict(values=cols, fill_color=c["bg"],
+                    font=dict(color=c["text"], size=12), align="center"),
+        cells=dict(
+            values=[rows[col] for col in cols],
+            fill_color=cell_colors,
+            font=dict(color=c["text"], size=11),
+            align="center", height=30,
         ),
     ))
     fig.update_layout(paper_bgcolor=c["card"], margin=dict(l=0, r=0, t=10, b=0))

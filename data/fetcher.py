@@ -106,6 +106,17 @@ def get_risk_free_rate() -> float:
     return RISK_FREE_RATE_DEFAULT
 
 
+def get_historical_prices(ticker: str, limit: int = 252) -> list:
+    """Fetch up to `limit` trading days of EOD price data, newest first."""
+    key = f"hist_{ticker}_{limit}"
+    cached = _load_cache(key)
+    if cached:
+        return cached
+    data = _get("historical-price-eod/full", {"symbol": ticker, "limit": limit})
+    _save_cache(key, data)
+    return data
+
+
 def get_live_price(ticker: str) -> dict:
     """Fetch current price + change without using the cache."""
     try:
